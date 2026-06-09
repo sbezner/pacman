@@ -157,6 +157,7 @@
   <div id="hud">
     <div>SCORE <span id="score">0</span></div>
     <div>HIGH <span id="high">0</span></div>
+    <div>LEVEL <span id="level">1</span></div>
     <div>LIVES <span id="lives">3</span></div>
   </div>
   <canvas id="game"></canvas>
@@ -268,6 +269,33 @@
       o.connect(g); g.connect(a.destination);
       o.start(t); o.stop(t + dur);
     }
+    // A single note scheduled at an absolute time (used by the intro jingle).
+    function note(freq, startT, dur, type, vol) {
+      const a = ctxA(); if (!a || muted) return;
+      const o = a.createOscillator(), g = a.createGain();
+      o.type = type || "square";
+      o.frequency.setValueAtTime(freq, startT);
+      g.gain.setValueAtTime(vol || 0.12, startT);
+      g.gain.exponentialRampToValueAtTime(0.0001, startT + dur);
+      o.connect(g); g.connect(a.destination);
+      o.start(startT); o.stop(startT + dur);
+    }
+    // Persistent oscillator for the looping background siren.
+    let sirenOsc = null, sirenGain = null;
+    function ensureSiren() {
+      const a = ctxA(); if (!a) return false;
+      if (!sirenOsc) {
+        sirenOsc = a.createOscillator();
+        sirenGain = a.createGain();
+        sirenOsc.type = "sawtooth";
+        sirenOsc.frequency.value = 320;
+        sirenGain.gain.value = 0;
+        sirenOsc.connect(sirenGain);
+        sirenGain.connect(a.destination);
+        try { sirenOsc.start(); } catch (e) {}
+      }
+      return true;
+    }
     let waka = false;
     return {
       resume,
@@ -277,7 +305,34 @@
       power() { slide(280, 560, 0.35, "square", 0.14); },
       eatGhost() { slide(420, 1100, 0.32, "sawtooth", 0.16); },
       death() { slide(520, 50, 0.9, "sawtooth", 0.20); },
-      start() { slide(330, 660, 0.25, "triangle", 0.16); }
+      fruit() { slide(660, 1320, 0.18, "triangle", 0.16); },
+      // Recognizable Pac-Man-style intro melody.
+      jingle() {
+        const a = ctxA(); if (!a || muted) return;
+        const seq = [988, 1319, 1047, 880, 1319, 1047, 880,
+                     1047, 1397, 1175, 932, 1397, 1175, 932];
+        let st = a.currentTime + 0.02;
+        for (const f of seq) { note(f, st, 0.12, "square", 0.12); st += 0.13; }
+      },
+      // Looping siren: center pitch rises with board progress (0..1); a faster,
+      // lower warble replaces it while ghosts are frightened.
+      siren(progress, frightened, frame) {
+        const a = ctxA(); if (!a) return;
+        if (!ensureSiren()) return;
+        const t = a.currentTime;
+        if (muted) { sirenGain.gain.setTargetAtTime(0, t, 0.03); return; }
+        let base, depth, rate, vol, type;
+        if (frightened) { base = 110; depth = 35; rate = 0.22; vol = 0.05; type = "square"; }
+        else { base = 270 + progress * 230; depth = 55; rate = 0.16; vol = 0.04; type = "sawtooth"; }
+        if (sirenOsc.type !== type) sirenOsc.type = type;
+        const f = base + Math.sin(frame * rate) * depth;
+        sirenOsc.frequency.setTargetAtTime(f, t, 0.01);
+        sirenGain.gain.setTargetAtTime(vol, t, 0.04);
+      },
+      sirenOff() {
+        const a = ctxA(); if (!a || !sirenGain) return;
+        sirenGain.gain.setTargetAtTime(0, a.currentTime, 0.05);
+      }
     };
   })();
 
@@ -334,19 +389,32 @@
   }
 
   // ---- Pac-Man --------------------------------------------------------------
-  // Speeds MUST evenly divide TILE (20) so actors stay grid-aligned,
-  // otherwise tile-center detection (turning / wall stops / eating) breaks.
-  const SPEED = 2;          // pixels per frame for pacman
-  const GHOST_SPEED = 2;
-  const FRIGHT_SPEED = 1;
+  // Movement is stepped 1px at a time (see movePac/ghostStep), so any speed
+  // value stays grid-aligned — every actor still lands exactly on tile centers
+  // (multiples of TILE) because 1 divides TILE. This lets speeds vary per level.
+  const BASE_PAC = 2.0;      // px/frame at level 1
+  const BASE_GHOST = 1.85;
+  const FRIGHT_BASE = 1.2;
   const EATEN_SPEED = 4;
+  const DEATH_DURATION = 90;       // frames for the death spin
+  const LEVELCLEAR_DURATION = 120; // frames for the maze flash
+
+  // Difficulty curve: ghosts ramp a touch faster than Pac-Man each level, and
+  // power-pellet frightened time shrinks, so later levels get tense.
+  function levelSpeedMul() { return 1 + Math.min(level - 1, 8) * 0.04; }
+  function ghostSpeedMul() { return 1 + Math.min(level - 1, 8) * 0.07; }
+  function frightDurationForLevel() { return Math.max(90, FRIGHT_DURATION - (level - 1) * 45); }
 
   const pac = {
     x: 14 * TILE, y: 23 * TILE,
     dir: "none", next: "none",
-    mouth: 0, mouthDir: 1,
+    mouth: 0, mouthDir: 1, acc: 0,
     spawnX: 14 * TILE, spawnY: 23 * TILE
   };
+
+  function buzz(pattern) {
+    if (navigator.vibrate) { try { navigator.vibrate(pattern); } catch (e) {} }
+  }
 
   function atTileCenter(obj) {
     return (obj.x % TILE === 0) && (obj.y % TILE === 0);
@@ -362,7 +430,7 @@
       name, color,
       x: sc * TILE, y: sr * TILE,
       spawnX: sc * TILE, spawnY: sr * TILE,
-      dir: "up",
+      dir: "up", acc: 0,
       scatterC, scatterR,
       mode: "scatter",      // scatter | chase | frightened | eaten
       inHouse: name !== "blinky",
@@ -398,7 +466,23 @@
   let stateTimer = 0;
   let level = 1;
 
-  const FRIGHT_DURATION = 7 * 60; // ~7 seconds at 60fps
+  let frightMax = 7 * 60;      // this level's frightened duration
+  let freezeTimer = 0;         // brief action freeze after eating a ghost
+  const popups = [];           // floating score texts {x,y,text,color,timer,vy}
+
+  // Bonus fruit (appears below the ghost house after enough pellets eaten)
+  let pelletsAtLevelStart = 0;
+  let fruit = null;            // { timer } while visible, else null
+  let fruitSpawns = 0;         // how many have appeared this level (max 2)
+  const FRUIT_R = 17, FRUIT_C1 = 13, FRUIT_C2 = 14;
+  const FRUIT_X = 14 * TILE, FRUIT_Y = FRUIT_R * TILE + TILE / 2;
+  const FRUIT_EMOJI = ["\u{1F352}", "\u{1F353}", "\u{1F34A}", "\u{1F34E}",
+                       "\u{1F348}", "\u{1F347}", "\u{1F514}", "\u{1F511}"];
+  const FRUIT_VALUES = [100, 300, 500, 500, 700, 700, 1000, 1000, 2000, 2000, 3000, 3000, 5000];
+  const fruitEmoji = () => FRUIT_EMOJI[Math.min(level - 1, FRUIT_EMOJI.length - 1)];
+  const fruitValue = () => FRUIT_VALUES[Math.min(level - 1, FRUIT_VALUES.length - 1)];
+
+  const FRIGHT_DURATION = 7 * 60; // ~7 seconds at 60fps (level-1 baseline)
   // scatter/chase schedule (frames). Classic-ish.
   const MODE_SCHEDULE = [
     { mode: "scatter", t: 7 * 60 },
@@ -414,24 +498,36 @@
   const scoreEl = document.getElementById("score");
   const highEl = document.getElementById("high");
   const livesEl = document.getElementById("lives");
+  const levelEl = document.getElementById("level");
   const msgEl = document.getElementById("msg");
 
   highEl.textContent = high;
 
+  // Build a fresh board and reset per-level state (pellets, fruit, difficulty).
+  function loadLevel() {
+    buildGrid();
+    pelletsAtLevelStart = totalPellets;
+    fruit = null;
+    fruitSpawns = 0;
+    frightMax = frightDurationForLevel();
+  }
+
   function resetPositions() {
     pac.x = pac.spawnX; pac.y = pac.spawnY;
-    pac.dir = "none"; pac.next = "none";
+    pac.dir = "none"; pac.next = "none"; pac.acc = 0;
     buildGhosts();
     frightenedTimer = 0;
+    freezeTimer = 0;
+    popups.length = 0;
     modeTimer = 0;
     modePhase = 0;
   }
 
   function newGame() {
-    buildGrid();
     score = 0;
     lives = 3;
     level = 1;
+    loadLevel();
     resetPositions();
     updateHud();
     state = "ready";
@@ -444,6 +540,7 @@
     scoreEl.textContent = score;
     livesEl.textContent = lives;
     highEl.textContent = high;
+    levelEl.textContent = level;
   }
 
   // ---- Input (shared by keyboard + touch) -----------------------------------
@@ -459,7 +556,8 @@
     if (!running) {
       running = true;
       msgEl.textContent = "";
-      sfx.start();
+      if (state === "ready") stateTimer = Math.max(stateTimer, 140); // let the jingle play
+      sfx.jingle();
       requestAnimationFrame(loop);
     }
     if (state === "gameover") {
@@ -565,7 +663,7 @@
         const dir = Math.abs(dx) > Math.abs(dy)
           ? (dx > 0 ? "right" : "left")
           : (dy > 0 ? "down" : "up");
-        if (dir !== curDir) { curDir = dir; inputDir(dir); }
+        if (dir !== curDir) { curDir = dir; inputDir(dir); buzz(12); }
       }
 
       function release() {
@@ -601,53 +699,86 @@
     return forGhost ? !isWall(nr, nc) : !isWallForPac(nr, nc);
   }
 
+  function pacSpeed() { return BASE_PAC * levelSpeedMul(); }
+
   function movePac() {
     if (pac.dir === "none") return;
 
-    if (atTileCenter(pac)) {
-      // try to turn toward queued direction
-      if (pac.next !== "none" && canMove(pac, pac.next, false)) {
-        pac.dir = pac.next;
+    pac.acc += pacSpeed();
+    while (pac.acc >= 1) {
+      pac.acc -= 1;
+
+      if (atTileCenter(pac)) {
+        // try to turn toward queued direction
+        if (pac.next !== "none" && canMove(pac, pac.next, false)) pac.dir = pac.next;
+        // if blocked ahead, stop
+        if (!canMove(pac, pac.dir, false)) { pac.acc = 0; break; }
+
+        // eat pellet at current tile
+        const t = tileOf(pac);
+        const cell = grid[t.r][t.c];
+        if (cell === T_PELLET) {
+          grid[t.r][t.c] = T_EMPTY; score += 10; totalPellets--; sfx.chomp(); bumpHigh();
+        } else if (cell === T_POWER) {
+          grid[t.r][t.c] = T_EMPTY; score += 50; totalPellets--;
+          triggerFrightened(); sfx.power(); bumpHigh();
+        }
+        maybeSpawnFruit();
+        checkFruitPickup();
+        if (totalPellets <= 0) { nextLevel(); return; }
       }
-      // if blocked ahead, stop
-      if (!canMove(pac, pac.dir, false)) {
-        return;
-      }
-      // eat pellet at current tile
-      const t = tileOf(pac);
-      const cell = grid[t.r][t.c];
-      if (cell === T_PELLET) {
-        grid[t.r][t.c] = T_EMPTY;
-        score += 10;
-        totalPellets--;
-        sfx.chomp();
-        bumpHigh();
-      } else if (cell === T_POWER) {
-        grid[t.r][t.c] = T_EMPTY;
-        score += 50;
-        totalPellets--;
-        triggerFrightened();
-        sfx.power();
-        bumpHigh();
-      }
-      if (totalPellets <= 0) {
-        nextLevel();
-        return;
-      }
+
+      const d = DIRS[pac.dir];
+      pac.x += d.x; pac.y += d.y;
+
+      // tunnel wrap (1px steps keep us aligned; snap to the far tile)
+      if (pac.x < 0) pac.x = (COLS - 1) * TILE;
+      else if (pac.x > (COLS - 1) * TILE) pac.x = 0;
     }
-
-    const d = DIRS[pac.dir];
-    pac.x += d.x * SPEED;
-    pac.y += d.y * SPEED;
-
-    // tunnel wrap (snap to aligned tile to preserve grid alignment)
-    if (pac.x < -TILE / 2) pac.x = (COLS - 1) * TILE;
-    else if (pac.x > (COLS - 1) * TILE + TILE / 2) pac.x = 0;
 
     // mouth animation
     pac.mouth += pac.mouthDir * 0.18;
     if (pac.mouth > 0.9) { pac.mouth = 0.9; pac.mouthDir = -1; }
     if (pac.mouth < 0) { pac.mouth = 0; pac.mouthDir = 1; }
+  }
+
+  // ---- Bonus fruit ----------------------------------------------------------
+  function maybeSpawnFruit() {
+    const eaten = pelletsAtLevelStart - totalPellets;
+    if (fruit === null && fruitSpawns < 2 &&
+        ((fruitSpawns === 0 && eaten >= 70) || (fruitSpawns === 1 && eaten >= 170))) {
+      fruit = { timer: 9 * 60 }; // visible ~9s
+      fruitSpawns++;
+    }
+  }
+
+  function checkFruitPickup() {
+    if (!fruit) return;
+    const t = tileOf(pac);
+    if (t.r === FRUIT_R && (t.c === FRUIT_C1 || t.c === FRUIT_C2)) {
+      const v = fruitValue();
+      score += v; bumpHigh();
+      addPopup(FRUIT_X, FRUIT_Y, v, "#ffd9a0", 75);
+      sfx.fruit();
+      buzz(20);
+      fruit = null;
+    }
+  }
+
+  function updateFruit() {
+    if (fruit) { fruit.timer--; if (fruit.timer <= 0) fruit = null; }
+  }
+
+  // ---- Score popups ---------------------------------------------------------
+  function addPopup(x, y, text, color, timer) {
+    popups.push({ x, y, text: String(text), color: color || "#fff", timer: timer || 60, vy: -0.3 });
+  }
+  function updatePopups() {
+    for (let i = popups.length - 1; i >= 0; i--) {
+      const p = popups[i];
+      p.y += p.vy; p.timer--;
+      if (p.timer <= 0) popups.splice(i, 1);
+    }
   }
 
   function bumpHigh() {
@@ -658,7 +789,7 @@
   }
 
   function triggerFrightened() {
-    frightenedTimer = FRIGHT_DURATION;
+    frightenedTimer = frightMax;
     frightStreak = 0;
     for (const g of ghosts) {
       if (g.mode !== "eaten") {
@@ -742,22 +873,29 @@
     g.dir = best.dir;
   }
 
-  function moveGhost(g) {
-    const speed = g.mode === "eaten" ? EATEN_SPEED
-                : g.mode === "frightened" ? FRIGHT_SPEED
-                : GHOST_SPEED;
+  function ghostSpeed(g) {
+    if (g.mode === "eaten") return EATEN_SPEED;
+    if (g.mode === "frightened") return FRIGHT_BASE * levelSpeedMul();
+    return BASE_GHOST * ghostSpeedMul();
+  }
 
-    // House logic: release timing (movement here is axis-aligned, so it stays on-grid)
+  function moveGhost(g) {
+    g.acc += ghostSpeed(g);
+    while (g.acc >= 1) { g.acc -= 1; ghostStep(g); }
+  }
+
+  // One 1px movement step for a ghost (keeps everything grid-aligned).
+  function ghostStep(g) {
+    // House logic: bob, then exit through the door (axis-aligned 1px moves).
     if (g.inHouse) {
-      g.bob = Math.sin(globalFrame / 10) * 2; // render-only bob, doesn't touch g.y
+      g.bob = Math.sin(globalFrame / 10) * 2; // render-only, doesn't touch g.y
       if (globalFrame >= g.releaseAt) {
         g.leaving = true;
         const tc = 14 * TILE;
         if (g.x !== tc) {
-          g.x += Math.sign(tc - g.x) * speed;
-          if (Math.abs(g.x - tc) < speed) g.x = tc;
+          g.x += Math.sign(tc - g.x);
         } else {
-          g.y -= speed;
+          g.y -= 1;
           if (g.y <= 11 * TILE) {
             g.y = 11 * TILE;
             g.inHouse = false;
@@ -796,12 +934,11 @@
     }
 
     const d = DIRS[g.dir];
-    g.x += d.x * speed;
-    g.y += d.y * speed;
+    g.x += d.x; g.y += d.y;
 
-    // tunnel wrap (snap to aligned tile to preserve grid alignment)
-    if (g.x < -TILE / 2) g.x = (COLS - 1) * TILE;
-    else if (g.x > (COLS - 1) * TILE + TILE / 2) g.x = 0;
+    // tunnel wrap (1px steps keep us aligned; snap to the far tile)
+    if (g.x < 0) g.x = (COLS - 1) * TILE;
+    else if (g.x > (COLS - 1) * TILE) g.x = 0;
   }
 
   // ---- Collisions -----------------------------------------------------------
@@ -817,6 +954,9 @@
           score += pts;
           sfx.eatGhost();
           bumpHigh();
+          addPopup(g.x + TILE / 2, g.y + TILE / 2, pts, "#33ffff", 40);
+          freezeTimer = 30;       // brief pause so the score reads
+          buzz([0, 40]);
         } else if (g.mode !== "eaten") {
           loseLife();
           return;
@@ -829,14 +969,16 @@
     lives--;
     updateHud();
     sfx.death();
+    sfx.sirenOff();
+    buzz([0, 80, 40, 120]);
     state = "dying";
-    stateTimer = 60;
+    stateTimer = DEATH_DURATION;
   }
 
   function nextLevel() {
-    level++;
+    sfx.sirenOff();
     state = "levelclear";
-    stateTimer = 60;
+    stateTimer = LEVELCLEAR_DURATION;
   }
 
   // ---- Mode scheduling ------------------------------------------------------
@@ -901,8 +1043,30 @@
       }
     }
 
-    drawGhosts();
-    if (state !== "dying" || (globalFrame % 8 < 4)) drawPac();
+    // bonus fruit
+    if (fruit && (state === "playing")) {
+      ctx.font = "18px serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(fruitEmoji(), FRUIT_X, FRUIT_Y);
+      ctx.textBaseline = "alphabetic";
+    }
+
+    // ghosts hidden during the death spin and the level-clear flash
+    if (state !== "dying" && state !== "levelclear") drawGhosts();
+    drawPac();
+
+    // floating score popups
+    if (popups.length) {
+      ctx.textAlign = "center";
+      ctx.font = "bold 13px 'Courier New'";
+      for (const p of popups) {
+        ctx.globalAlpha = Math.max(0, Math.min(1, p.timer / 30));
+        ctx.fillStyle = p.color;
+        ctx.fillText(p.text, p.x, p.y);
+      }
+      ctx.globalAlpha = 1;
+    }
 
     // overlays
     if (state === "ready") {
@@ -924,7 +1088,9 @@
   }
 
   function drawWall(r, c, x, y) {
-    ctx.strokeStyle = "#2121de";
+    // Flash blue/white when a level is cleared.
+    const flash = state === "levelclear" && (Math.floor(stateTimer / 8) % 2 === 0);
+    ctx.strokeStyle = flash ? "#ffffff" : "#2121de";
     ctx.lineWidth = 2.5;
     const s = 1.5;
     // Draw edges only where neighbor is not a wall, for a cleaner maze look.
@@ -938,7 +1104,7 @@
     ctx.stroke();
     // Fallback: if fully surrounded, draw a faint block so interior reads as solid.
     if (top && bot && left && right) {
-      ctx.fillStyle = "#10108a";
+      ctx.fillStyle = flash ? "#7a7aff" : "#10108a";
       ctx.fillRect(x, y, TILE, TILE);
     }
   }
@@ -947,6 +1113,20 @@
     const cx = pac.x + TILE / 2;
     const cy = pac.y + TILE / 2;
     const radius = TILE / 2 - 1;
+
+    // Death spin: mouth opens wider over the death duration until Pac-Man vanishes.
+    if (state === "dying") {
+      const p = 1 - stateTimer / DEATH_DURATION; // 0 -> 1
+      if (p >= 1) return; // fully closed / gone
+      ctx.fillStyle = "#ffff00";
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, radius, -Math.PI / 2 + p * Math.PI, -Math.PI / 2 + Math.PI * 2 - p * Math.PI);
+      ctx.closePath();
+      ctx.fill();
+      return;
+    }
+
     let angle = 0;
     if (pac.dir === "right") angle = 0;
     else if (pac.dir === "down") angle = Math.PI / 2;
@@ -1016,22 +1196,34 @@
     if (!paused) {
       globalFrame++;
       step();
+    } else {
+      sfx.sirenOff();
     }
     draw();
     requestAnimationFrame(loop);
   }
 
   function step() {
+    if (state !== "playing") sfx.sirenOff();
+
     switch (state) {
       case "ready":
         stateTimer--;
         if (stateTimer <= 0) { state = "playing"; msgEl.textContent = ""; }
         break;
       case "playing":
+        // Action freeze (after eating a ghost): hold movement, keep popups alive.
+        if (freezeTimer > 0) { freezeTimer--; updatePopups(); break; }
         updateModes();
         movePac();
+        if (state !== "playing") { updatePopups(); break; } // movePac may have cleared the level
         for (const g of ghosts) moveGhost(g);
         checkCollisions();
+        updateFruit();
+        updatePopups();
+        // Looping siren: pitch rises as the board empties; warbles when frightened.
+        sfx.siren((pelletsAtLevelStart - totalPellets) / Math.max(1, pelletsAtLevelStart),
+                  frightenedTimer > 0, globalFrame);
         updateHud();
         break;
       case "dying":
@@ -1048,8 +1240,10 @@
         break;
       case "levelclear":
         stateTimer--;
+        updatePopups();
         if (stateTimer <= 0) {
-          buildGrid();
+          level++;
+          loadLevel();
           resetPositions();
           state = "ready";
           stateTimer = 60;
