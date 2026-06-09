@@ -280,22 +280,6 @@
       o.connect(g); g.connect(a.destination);
       o.start(startT); o.stop(startT + dur);
     }
-    // Persistent oscillator for the looping background siren.
-    let sirenOsc = null, sirenGain = null;
-    function ensureSiren() {
-      const a = ctxA(); if (!a) return false;
-      if (!sirenOsc) {
-        sirenOsc = a.createOscillator();
-        sirenGain = a.createGain();
-        sirenOsc.type = "sawtooth";
-        sirenOsc.frequency.value = 320;
-        sirenGain.gain.value = 0;
-        sirenOsc.connect(sirenGain);
-        sirenGain.connect(a.destination);
-        try { sirenOsc.start(); } catch (e) {}
-      }
-      return true;
-    }
     let waka = false;
     return {
       resume,
@@ -313,25 +297,6 @@
                      1047, 1397, 1175, 932, 1397, 1175, 932];
         let st = a.currentTime + 0.02;
         for (const f of seq) { note(f, st, 0.12, "square", 0.12); st += 0.13; }
-      },
-      // Looping siren: center pitch rises with board progress (0..1); a faster,
-      // lower warble replaces it while ghosts are frightened.
-      siren(progress, frightened, frame) {
-        const a = ctxA(); if (!a) return;
-        if (!ensureSiren()) return;
-        const t = a.currentTime;
-        if (muted) { sirenGain.gain.setTargetAtTime(0, t, 0.03); return; }
-        let base, depth, rate, vol, type;
-        if (frightened) { base = 110; depth = 35; rate = 0.22; vol = 0.05; type = "square"; }
-        else { base = 270 + progress * 230; depth = 55; rate = 0.16; vol = 0.04; type = "sawtooth"; }
-        if (sirenOsc.type !== type) sirenOsc.type = type;
-        const f = base + Math.sin(frame * rate) * depth;
-        sirenOsc.frequency.setTargetAtTime(f, t, 0.01);
-        sirenGain.gain.setTargetAtTime(vol, t, 0.04);
-      },
-      sirenOff() {
-        const a = ctxA(); if (!a || !sirenGain) return;
-        sirenGain.gain.setTargetAtTime(0, a.currentTime, 0.05);
       }
     };
   })();
@@ -969,14 +934,12 @@
     lives--;
     updateHud();
     sfx.death();
-    sfx.sirenOff();
     buzz([0, 80, 40, 120]);
     state = "dying";
     stateTimer = DEATH_DURATION;
   }
 
   function nextLevel() {
-    sfx.sirenOff();
     state = "levelclear";
     stateTimer = LEVELCLEAR_DURATION;
   }
@@ -1196,16 +1159,12 @@
     if (!paused) {
       globalFrame++;
       step();
-    } else {
-      sfx.sirenOff();
     }
     draw();
     requestAnimationFrame(loop);
   }
 
   function step() {
-    if (state !== "playing") sfx.sirenOff();
-
     switch (state) {
       case "ready":
         stateTimer--;
@@ -1221,9 +1180,6 @@
         checkCollisions();
         updateFruit();
         updatePopups();
-        // Looping siren: pitch rises as the board empties; warbles when frightened.
-        sfx.siren((pelletsAtLevelStart - totalPellets) / Math.max(1, pelletsAtLevelStart),
-                  frightenedTimer > 0, globalFrame);
         updateHud();
         break;
       case "dying":

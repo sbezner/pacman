@@ -29,7 +29,7 @@ dependencies. Just open `pacman.html` in any modern browser.
   power-pellet frightened time shrinks each level. A LEVEL indicator shows progress.
 - **Death spin animation** and a blue/white **maze flash** on clearing a level.
 - Fully synthesized sound via the Web Audio API (no audio files): waka chomps,
-  an intro jingle, and a looping siren that rises in pitch as the board empties.
+  power-pellet, ghost-eat, fruit, and death effects, plus an intro jingle.
 - Responsive layout with automatic mobile/tablet touch controls — a draggable
   arcade joystick plus swipe steering, with haptic feedback where supported.
 - High score saved in the browser's local storage.
